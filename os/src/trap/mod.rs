@@ -40,6 +40,7 @@ pub fn init() {
 pub fn enable_timer_interrupt() {
     unsafe {
         sie::set_stimer();
+        //sad
     }
 }
 
