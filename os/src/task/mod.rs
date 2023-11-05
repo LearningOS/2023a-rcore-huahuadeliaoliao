@@ -14,12 +14,14 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::{MAX_APP_NUM, MAX_SYSCALL_NUM};
+use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use crate::syscall::TaskInfo;
+use crate::timer;
 use lazy_static::*;
 use switch::__switch;
-pub use task::{TaskControlBlock,TaskStatus};
+pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
 
@@ -51,13 +53,11 @@ lazy_static! {
     /// Global variable: TASK_MANAGER
     pub static ref TASK_MANAGER: TaskManager = {
         let num_app = get_num_app();
-        let mut tasks = [TaskControlBlock {
-            task_cx: TaskContext::zero_init(),
-            task_status: TaskStatus::UnInit,
-            syscall_times: [0; MAX_SYSCALL_NUM],
-            user_time: 0,
-            kernel_time: 0,
-        }; MAX_APP_NUM];
+        // Apply new method to create TaskControlBlock
+        let mut tasks = [TaskControlBlock::new(
+            TaskStatus::UnInit,
+            TaskContext::zero_init(),
+        ); MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
@@ -125,6 +125,12 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+
+            // If next process is sheduled the first time, initiate start_time
+            if inner.tasks[next].start_time == 0 {
+                inner.tasks[next].start_time = timer::get_time_us();
+            }
+
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -136,6 +142,35 @@ impl TaskManager {
             // go back to user mode
         } else {
             panic!("All applications completed!");
+        }
+    }
+
+    /// Add method to update current syscall count
+    fn update_syscall_count(&self, syscall_id:usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
+    }
+
+    /// Add method to get TaskInfo of given task_id
+    /// if task_id is Option::None, then get TaskInfo of current task
+    fn get_task_info(&self, task_id:Option<usize>) -> Option<TaskInfo> {
+        let inner = self.inner.exclusive_access();
+        // 
+        let task_id = if let Some(id) = task_id {id} else {inner.current_task};
+        if task_id < inner.tasks.len() {
+            Option::Some(TaskInfo {
+                status: inner.tasks[task_id].task_status,
+                syscall_times: inner.tasks[task_id].syscall_times.clone(),
+                time: match inner.tasks[task_id].start_time {
+                    0 => 0,
+                    // transfer to millisecond
+                    t => (timer::get_time_us() - t) / 1000,
+                },
+            })
+        }
+        else {
+            Option::None
         }
     }
 }
@@ -173,18 +208,14 @@ pub fn exit_current_and_run_next() {
     run_next_task();
 }
 
-/// Get the control block of the current task.
-pub fn get_current_task_block() -> TaskControlBlock {
-    // Get the control block of the current task from the task manager.
-    let inner = TASK_MANAGER.inner.exclusive_access();
-    let current = inner.current_task;
-    inner.tasks[current].clone()
+// Add method for task management
+
+/// Update the syscall count of current 'Running' task
+pub fn update_current_syscall_count(syscall_id:usize) {
+    TASK_MANAGER.update_syscall_count(syscall_id);
 }
 
-/// Update the syscall times for the current task.
-pub fn update_task_syscall_times(syscall_id: usize) {
-    // Update the syscall times for the current task.
-    let mut inner = TASK_MANAGER.inner.exclusive_access();
-    let current = inner.current_task;
-    inner.tasks[current].syscall_times[syscall_id] += 1;
+/// Get current task infomation
+pub fn get_current_task_info() -> Option<TaskInfo> {
+    TASK_MANAGER.get_task_info(Option::None)
 }
