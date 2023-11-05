@@ -16,6 +16,8 @@ mod task;
 
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
+use crate::syscall::TaskInfo;
+use crate::timer;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -140,6 +142,12 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+
+            // If next process is sheduled the first time, initiate start_time
+            if inner.tasks[next].start_time == 0 {
+                inner.tasks[next].start_time = timer::get_time_us();
+            }
+
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -152,6 +160,49 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Add method to update current syscall count
+    fn update_syscall_count(&self, syscall_id:usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
+    }
+
+    /// Add method to get TaskInfo of given task_id
+    /// if task_id is Option::None, then get TaskInfo of current task
+    fn get_task_info(&self, task_id:Option<usize>) -> Option<TaskInfo> {
+        let inner = self.inner.exclusive_access();
+        let task_id = if let Some(id) = task_id {id} else {inner.current_task};
+        if task_id < inner.tasks.len() {
+            Option::Some(TaskInfo {
+                status: inner.tasks[task_id].task_status,
+                syscall_times: inner.tasks[task_id].syscall_times.clone(),
+                time: match inner.tasks[task_id].start_time {
+                    0 => 0,
+                    // transfer to millisecond
+                    t => (timer::get_time_us() - t) / 1000,
+                },
+            })
+        }
+        else {
+            Option::None
+        }
+    }
+
+    /// map a segment of menory for current task
+    pub fn map_current_memory(&self, start: usize, len: usize, port: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let port = (port | 1 << 3) as u8;
+        inner.tasks[current].memory_set.map_area(start.into(), (start + len).into(), port.into())
+    }
+
+    /// unmap a segment of menory for current task
+    pub fn unmap_current_memory(&self, start: usize, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.unmap_area(start.into(), (start + len).into())
     }
 }
 
@@ -201,4 +252,29 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+
+// Add method for task management
+
+/// Update the syscall count of current 'Running' task
+pub fn update_current_syscall_count(syscall_id:usize) {
+    TASK_MANAGER.update_syscall_count(syscall_id);
+}
+
+/// Get current task infomation
+pub fn get_current_task_info() -> Option<TaskInfo> {
+    TASK_MANAGER.get_task_info(Option::None)
+}
+
+/// Map a range of memory for current task
+#[allow(unused)]
+pub fn current_memory_mmap(start: usize, len: usize, port: usize) -> bool{
+    TASK_MANAGER.map_current_memory(start, len, port)
+}
+
+/// Unmap a range of memory
+#[allow(unused)]
+pub fn current_memory_unmmap(start: usize, len: usize) -> bool{
+    TASK_MANAGER.unmap_current_memory(start, len)
 }

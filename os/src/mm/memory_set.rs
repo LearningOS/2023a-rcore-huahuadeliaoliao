@@ -1,5 +1,6 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
+use super::frame_allocator::MemoryError;
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
@@ -9,9 +10,12 @@ use crate::config::{
 };
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use iset::IntervalMap;
 use core::arch::asm;
+use core::ops::Range;
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -36,7 +40,9 @@ lazy_static! {
 /// address space
 pub struct MemorySet {
     page_table: PageTable,
-    areas: Vec<MapArea>,
+    // areas:Vec<MapArea>
+    // use interval map to store the areas
+    areas: IntervalMap<VirtPageNum,MapArea>,
 }
 
 impl MemorySet {
@@ -44,7 +50,7 @@ impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
             page_table: PageTable::new(),
-            areas: Vec::new(),
+            areas: IntervalMap::new(),
         }
     }
     /// Get the page table token
@@ -57,18 +63,27 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) {
+    )   {
         self.push(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
-        );
+        )
     }
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
-        map_area.map(&mut self.page_table);
+        let vpn_range = map_area.vpn_range;
+        let vpn_start = vpn_range.get_start();
+        let vpn_end = vpn_range.get_end();
+        map_area.map(&mut self.page_table).
+            expect(
+                format!("[Kernel]: Fail to allocate Frames from {:x} to {:x}", 
+                vpn_start.0, vpn_end.0).as_str()
+            );
         if let Some(data) = data {
             map_area.copy_data(&mut self.page_table, data);
         }
-        self.areas.push(map_area);
+        if vpn_start < vpn_end {
+            self.areas.insert(vpn_start..vpn_end, map_area);
+        }
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
@@ -236,9 +251,8 @@ impl MemorySet {
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
-        if let Some(area) = self
-            .areas
-            .iter_mut()
+        if let Some(area) = self.areas
+            .values_mut(..)
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
             area.shrink_to(&mut self.page_table, new_end.ceil());
@@ -253,10 +267,138 @@ impl MemorySet {
     pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self
             .areas
-            .iter_mut()
+            .values_mut(..)
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
             area.append_to(&mut self.page_table, new_end.ceil());
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// map a new area
+    pub fn map_area(&mut self, 
+        start_va: VirtAddr, 
+        end_va: VirtAddr, 
+        permission: MapPermission) -> bool {
+        if let Some(t) = self
+            .areas
+            .values(start_va.into()..end_va.ceil())
+            .next() {
+                println!("[kernel]: map failed, overlapped interval {:?}..{:?}",
+                    t.vpn_range.get_start(),t.vpn_range.get_end());
+                false
+        } else {
+            // self.insert_framed_area(start_va, end_va, permission);
+            let mut map_area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+            match map_area.map(&mut self.page_table) {
+                Ok(_) => {
+                    self.areas.insert(
+                        map_area.vpn_range.get_start()..map_area.vpn_range.get_end(), 
+                        map_area);
+                    true
+                }
+                Err(_) => {
+                    println!("[kernel]: map failed, no enough memory for {:?}..{:?}",start_va, end_va);
+                    false
+                }
+            }
+        }
+    }
+
+    /// check if a Vec of VPNRange contiously contain start_vpn..end_vpn
+    /// return false if overlapped_areas not contiously contain start_vpn..end_vpn 
+    /// or overlapped_areas is empty
+    fn continiously_contain(
+        overlapped_areas:&Vec<Range<VirtPageNum>>,
+        start_vpn: VirtPageNum, 
+        end_vpn: VirtPageNum) -> bool{
+        match overlapped_areas.len() {
+            0 => false,
+            1 => {
+                let first = &overlapped_areas[0];
+                if start_vpn < first.start || end_vpn > first.end {
+                    false
+                }
+                else {
+                    true
+                }
+            },
+            n => {
+                let first = &overlapped_areas[0];
+                let last = &overlapped_areas[n-1];
+                if start_vpn < first.start || end_vpn > last.end {
+                    return false;
+                }
+                let mut vec_end_vpn = first.end;
+                for i in 1..n {
+                    let next = &overlapped_areas[i];
+                    if vec_end_vpn != next.start {
+                        return false
+                    }
+                    vec_end_vpn = next.end;
+                }
+                true
+            }
+        } 
+    }
+
+    /// split a contious Maparea into three pieces (head_area, mid_area_vector, tail_area)
+    fn split_into_three(mut area_vec: Vec<MapArea>,start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> (MapArea, Vec<MapArea>, MapArea) {
+        assert!(area_vec.len() > 0);
+        let mut mid_areas = Vec::new();
+        match area_vec.len() {
+            1 => {
+                let range = VPNRange::new(start_vpn, end_vpn);
+                let (left, mid, right) = area_vec.remove(0).split_by_range(range);
+                mid_areas.push(mid);
+                (left, mid_areas, right)
+            }
+            _ => {
+                // split the first area
+                let range = VPNRange::new(start_vpn, area_vec[0].vpn_range.get_end());
+                let (left, to_unmap, _) = area_vec.remove(0).split_by_range(range);
+                mid_areas.push(to_unmap);
+                let range = VPNRange::new(area_vec.last().unwrap().vpn_range.get_start(), end_vpn);
+                let (_, to_unmap, right) = area_vec.pop().unwrap().split_by_range(range);
+                mid_areas.push(to_unmap);
+                for i in area_vec {
+                    mid_areas.push(i);
+                }
+                (left, mid_areas, right)
+            }
+        }
+    }
+
+    /// unmap a area
+    pub fn unmap_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.into();
+        let end_vpn = end_va.ceil();
+        // get overlapped areas which is sorted by start vpn
+        let overlapped_intervals:Vec<_> = self.areas.intervals(start_vpn..end_vpn).collect();
+
+        if Self::continiously_contain(&overlapped_intervals,start_vpn,end_vpn) {
+            let overlapped_items:Vec<_> = overlapped_intervals
+                .into_iter()
+                .map(|x| self.areas.remove(x).unwrap())
+                .collect();
+            let (head, mut to_unmap, tail) = Self::split_into_three(overlapped_items, start_vpn, end_vpn);
+
+            for area in to_unmap.iter_mut() {
+                area.unmap(&mut self.page_table);
+            }
+            drop(to_unmap);
+
+            let (l, r) = (head.vpn_range.get_start(),head.vpn_range.get_end());
+            if l != r {
+                self.areas.insert(l..r, head);
+            }
+
+            let (l, r) = (tail.vpn_range.get_start(),tail.vpn_range.get_end());
+            if l != r {
+                self.areas.insert(l..r, tail);
+            }
             true
         } else {
             false
@@ -287,20 +429,26 @@ impl MapArea {
             map_perm,
         }
     }
-    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+    // deal with no enough memory
+    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> Result<(), MemoryError> {
         let ppn: PhysPageNum;
         match self.map_type {
             MapType::Identical => {
                 ppn = PhysPageNum(vpn.0);
             }
             MapType::Framed => {
-                let frame = frame_alloc().unwrap();
-                ppn = frame.ppn;
-                self.data_frames.insert(vpn, frame);
+                if let Some(frame) = frame_alloc() {
+                    ppn = frame.ppn;
+                    self.data_frames.insert(vpn, frame);
+                }
+                else {
+                    return Err(MemoryError::FrameAllocate);
+                }
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
+        Ok(())
     }
     #[allow(unused)]
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -309,10 +457,11 @@ impl MapArea {
         }
         page_table.unmap(vpn);
     }
-    pub fn map(&mut self, page_table: &mut PageTable) {
+    pub fn map(&mut self, page_table: &mut PageTable) -> Result<(), MemoryError> {
         for vpn in self.vpn_range {
-            self.map_one(page_table, vpn);
+            self.map_one(page_table, vpn)?
         }
+        Ok(())
     }
     #[allow(unused)]
     pub fn unmap(&mut self, page_table: &mut PageTable) {
@@ -330,7 +479,7 @@ impl MapArea {
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
-            self.map_one(page_table, vpn)
+            self.map_one(page_table, vpn);
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
@@ -356,6 +505,45 @@ impl MapArea {
             current_vpn.step();
         }
     }
+
+    /// split the area by range
+    pub fn split_by_range(self, range: VPNRange) -> (Self, Self, Self) {
+        let left = range.get_start();
+        let right = range.get_end();
+        
+        let mut drop_map = BTreeMap::new();
+        let mut left_map = BTreeMap::new();
+        let mut right_map = BTreeMap::new();
+
+        for (vpn, tracer) in self.data_frames {
+            if vpn >= self.vpn_range.get_start() && vpn < left {
+                left_map.insert(vpn, tracer);
+            } else if vpn >= right && vpn < self.vpn_range.get_end() {
+                right_map.insert(vpn, tracer);
+            } else {
+                drop_map.insert(vpn, tracer);
+            }
+        }
+        let left_area = Self {
+            vpn_range: VPNRange::new(self.vpn_range.get_start(), left),
+            data_frames: left_map,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+        };
+        let drop_area = Self {
+            vpn_range: VPNRange::new(left, right),
+            data_frames: drop_map,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+        };
+        let right_area = Self {
+            vpn_range: VPNRange::new(right, self.vpn_range.get_end()),
+            data_frames: right_map,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+        };
+        (left_area, drop_area, right_area)
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -376,6 +564,13 @@ bitflags! {
         const X = 1 << 3;
         ///Accessible in U mode
         const U = 1 << 4;
+    }
+}
+
+/// transfer u8 to MapPermission 
+impl From<u8> for MapPermission {
+    fn from(value: u8) -> Self {
+        MapPermission { bits: (value << 1) }
     }
 }
 
