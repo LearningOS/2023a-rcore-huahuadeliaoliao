@@ -8,9 +8,11 @@ use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
 use crate::sync::UPSafeCell;
+use crate::syscall::TaskInfo;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
+use crate::timer;
 
 /// Processor management structure
 pub struct Processor {
@@ -59,6 +61,10 @@ pub fn run_tasks() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
+            // If next process is sheduled the first time, initiate start_time
+            if task_inner.start_time == 0 {
+                task_inner.start_time = timer::get_time_us();
+            }
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             // release coming task_inner manually
@@ -107,5 +113,55 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     drop(processor);
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
+    }
+}
+
+/// Add method to update current syscall count
+pub fn update_current_syscall_count(syscall_id:usize) {
+    if let Some(inner) = current_task(){
+        let mut inner = inner.inner_exclusive_access();
+        inner.syscall_times[syscall_id] += 1;
+    }
+}
+
+/// if task_id is Option::None, then get TaskInfo of current task
+pub fn get_current_task_info() -> Option<TaskInfo> {
+    if let Some(tcb_ptr) = current_task() {
+        let inner = tcb_ptr.inner_exclusive_access();
+        Some(TaskInfo {
+            status: inner.task_status,
+            syscall_times: inner.syscall_times.clone(),
+            time: match inner.start_time {
+                0 => 0,
+                // transfer to millisecond
+                t => (timer::get_time_us() - t) / 1000,
+            },
+        })
+    }
+    else {
+        None
+    }
+}
+
+/// map a segment of menory for current task
+pub fn map_current_memory(start: usize, len: usize, port: usize) -> bool {
+    if let Some(inner) = current_task(){
+        let mut inner = inner.inner_exclusive_access();
+        let port = (port | 1 << 3) as u8;
+        inner.memory_set.map_area(start.into(), (start + len).into(), port.into())
+    }
+    else {
+        false
+    }
+}
+
+/// unmap a segment of menory for current task
+pub fn unmap_current_memory(start: usize, len: usize) -> bool {
+    if let Some(inner) = current_task(){
+        let mut inner = inner.inner_exclusive_access();
+        inner.memory_set.unmap_area(start.into(), (start + len).into())
+    }
+    else {
+        false
     }
 }

@@ -1,13 +1,15 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
+use super::manager::Stride;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{TRAP_CONTEXT_BASE, MAX_SYSCALL_NUM};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::hash::Hash;
 
 /// Task control block structure
 ///
@@ -24,6 +26,20 @@ pub struct TaskControlBlock {
     inner: UPSafeCell<TaskControlBlockInner>,
 }
 
+impl Hash for TaskControlBlock {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.pid.0.hash(state);
+    }
+}
+
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, _other: &Self) -> bool {
+        false
+    }
+}
+
+impl Eq for TaskControlBlock {}
+
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
@@ -37,6 +53,18 @@ impl TaskControlBlock {
 }
 
 pub struct TaskControlBlockInner {
+    /// Stride for shedule
+    pub stride: Stride,
+
+    /// Stride for shedule
+    pub priority: usize,
+
+    /// start time of task to run
+    pub start_time: usize,
+
+    /// start time of task to run
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
 
@@ -108,6 +136,10 @@ impl TaskControlBlock {
             kernel_stack,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
+                    stride: Stride::new(),
+                    priority: 16,
+                    start_time:0,
+                    syscall_times:[0;MAX_SYSCALL_NUM],
                     trap_cx_ppn,
                     base_size: user_sp,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
@@ -181,6 +213,11 @@ impl TaskControlBlock {
             kernel_stack,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
+                    stride: Stride::new(),
+                    // set the child priority to 16
+                    priority: 16,
+                    start_time:0,
+                    syscall_times:[0;MAX_SYSCALL_NUM],
                     trap_cx_ppn,
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),

@@ -7,6 +7,12 @@ use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
 use lazy_static::*;
 
+/// Error enum for memory
+#[derive(Debug)]
+pub enum MemoryError {
+    FrameAllocate,
+}
+
 /// tracker for physical page frame allocation and deallocation
 pub struct FrameTracker {
     /// physical page number

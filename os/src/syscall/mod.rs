@@ -40,6 +40,8 @@ const SYSCALL_SPAWN: usize = 400;
 /// taskinfo syscall
 const SYSCALL_TASK_INFO: usize = 410;
 
+pub use process::TaskInfo;
+
 mod fs;
 mod process;
 

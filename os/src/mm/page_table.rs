@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+use crate::config::PAGE_SIZE;
 
 bitflags! {
     /// page table entry flags
@@ -161,6 +162,7 @@ impl PageTable {
 }
 
 /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
+/// Add Some wrapper to return None if translate failed
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
@@ -169,7 +171,13 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        // should not panic
+        // let ppn = page_table.translate(vpn).unwrap().ppn();
+        let ppn = if let Some(pte) = page_table.translate(vpn) {
+                pte.ppn()
+            } else {
+                break;
+            };
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
@@ -212,4 +220,56 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
         .translate_va(VirtAddr::from(va))
         .unwrap()
         .get_mut()
+}
+
+/// Copy data from kernel space to user space, return bytes not copyed
+/// return bytes not copyed
+pub fn copy_to_user<T>(token:usize, user_ptr: *mut T, kernel_ptr: *const T, len:usize) -> usize {
+    let dst_buffers = translated_byte_buffer(
+                token,
+                user_ptr as *const u8,
+                len
+            );
+    // one buffer store at most one page
+    let remain_bytes = len - (dst_buffers.len() - 1) * PAGE_SIZE - dst_buffers[dst_buffers.len() - 1].len();
+    // warn: must be identify map in kernel
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            kernel_ptr as *const _ as *const u8,
+            len
+        )};
+    // copy data
+    let mut start = 0;
+    for buffer in dst_buffers {
+        let end = start + buffer.len();
+        buffer.copy_from_slice(&src[start..end]);
+        start = end;
+    }
+    remain_bytes
+}
+
+/// Copy data from user space to kernel space, return bytes not copyed
+/// return bytes not copyed
+pub fn copy_from_user<T>(token:usize, kernel_ptr: *const T, user_ptr: *mut T, len:usize) -> usize {
+        let src_buffers = translated_byte_buffer(
+            token,
+            user_ptr as *const u8,
+            len
+        );
+    // one buffer store at most one page
+    let remain_bytes = len - (src_buffers.len() - 1) * PAGE_SIZE - src_buffers[src_buffers.len() - 1].len();
+    // warn: must be identify map in kernel
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(
+            kernel_ptr as *const _ as *mut u8,
+            len
+        )};
+    // copy data
+    let mut start = 0;
+    for buffer in src_buffers {
+        let end = start + buffer.len();
+        dst[start..end].copy_from_slice(&buffer);
+        start = end;
+    }
+    remain_bytes
 }
